@@ -6,6 +6,8 @@ import os
 # 假設 GridTradingBot 和所有必要的常量、logger 都從 bot.py 導入
 from bot import GridTradingBot, logger 
 from avellaneda_utils import auto_calculate_params
+from dotenv import load_dotenv
+load_dotenv()
 
 # ==================== Avellaneda 參數配置 (動態獲取) ====================
 # 【重要】這些參數將在 main 函數中被 auto_calculate_params 的結果覆蓋
@@ -16,8 +18,8 @@ AVE_SIGMA = 0.0       # <--- 初始為 0，將被計算值覆蓋
 AVE_ETA = 0.0         # <--- 初始為 0，將被計算值覆蓋
 
 # 假設 bot.py 中的核心配置
-API_KEY = "" 
-API_SECRET = ""
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
 COIN_NAME = "XRP" 
 GRID_SPACING = 0.0006
 TAKE_PROFIT_SPACING = 0.0004
