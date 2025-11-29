@@ -27,6 +27,7 @@ POSITION_LIMIT = 100  # 持倉數量閾值
 ORDER_COOLDOWN_TIME = 60  # 鎖倉後的反向掛單冷卻時間（秒）
 SYNC_TIME = 3  # 同步時間（秒）
 ORDER_FIRST_TIME = 1  # 首單間隔時間
+STRATEGY_THROTTLE_INTERVAL = 10
 
 # ==================== 日志配置 ====================
 script_name = os.path.splitext(os.path.basename(__file__))[0]
@@ -89,6 +90,7 @@ class GridTradingBot:
         self.mid_price_short = 0
         self.lower_price_short = 0
         self.upper_price_short = 0
+        self.last_strategy_run_time = 0.0
 
     def _initialize_exchange(self):
         """初始化交易所 API"""
@@ -284,8 +286,19 @@ class GridTradingBot:
         data = json.loads(message)
         if data.get("event") == "update":
             self.latest_price = float(data["result"][0]["last"])
-            print(f"最新價格: {self.latest_price:.8f}")
+            # print(f"最新價格: {self.latest_price:.8f}") # 可以註釋掉這行以減少終端輸出
 
+            # --- 頻率控制：策略節流 (Throttling) 邏輯 START ---
+            current_time = time.time()
+            # 檢查是否已超過最小間隔
+            if current_time - self.last_strategy_run_time < STRATEGY_THROTTLE_INTERVAL:
+                return  # 間隔未到，跳過本次策略調整
+
+            # 更新上次執行時間
+            self.last_strategy_run_time = current_time
+            # --- 頻率控制：策略節流 (Throttling) 邏輯 END ---
+
+            # ... (以下為原本的同步邏輯) ...
             if time.time() - self.last_position_update_time > SYNC_TIME:
                 self.long_position, self.short_position = self.get_position()
                 self.last_position_update_time = time.time()
