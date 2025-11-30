@@ -2,16 +2,15 @@ import asyncio
 import time
 import os
 # 假設 GridTradingBot 和所有必要的常量、logger 都從 bot.py 導入
-from bot import GridTradingBot, logger 
-from avellaneda_utils import auto_calculate_params, compute_glft_params, calibrate_from_deltas
+from bot import GridTradingBot, logger, POSITION_LIMIT
+from avellaneda_utils import auto_calculate_params, compute_glft_params, calibrate_from_deltas, solve_gamma_for_risk_target
 from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== Avellaneda 參數配置 (動態獲取) ====================
 # 【重要】這些參數將在 main 函數中被 auto_calculate_params 的結果覆蓋
-AVE_GAMMA = float(os.getenv("AVE_GAMMA", 10)) # 風險厭惡係數 (從環境變數讀取，預設為 10)
-# 注意: 原來的 1.0 對於幣圈(價格大)可能過大，或者需要視為 "每單位合約"
-# 如果 gamma 過大，Spread 會非常寬。
+AVE_GAMMA = float(os.getenv("AVE_GAMMA", 10)) # (作為備用/初始值)
+AUTO_GAMMA_TARGET_RATIO = float(os.getenv("AUTO_GAMMA_TARGET_RATIO", 0.8)) # 自動 Gamma 目標: 滿倉時 Skew 是 Spread 的幾倍 (0.8 = 80% HalfSpread)
 
 AVE_T_END = 1         # (GLFT 模型中此參數不再直接用於定價，保留作為參考或擴展)
 Taker_Fee_Rate = 0.0005 # <-- 【請在此處設置您的 Taker 費率】
@@ -43,12 +42,11 @@ class AvellanedaGridBot(GridTradingBot):
         super().__init__(api_key, api_secret, coin_name, grid_spacing, initial_quantity, leverage, take_profit_spacing)
         
         # 2. 初始化 Avellaneda 專有參數
-        # 這裡使用的是 main 函數計算後的最新全局變量值
-        self.gamma = gamma          # 風險厭惡係數
+        self.gamma = gamma          # 初始 Gamma
         self.A = A                  # 交易強度參數 A
         self.k = k                  # 流動性衰減參數 k (kappa)
         self.sigma = sigma          # 波動率估計 (百分比/時間)
-        self.T_end = T_end          # (GLFT 模型主要使用 A, k，T_end 僅作備用)
+        self.T_end = T_end          
         self.reserve_price = 0      
         self.inventory = 0          
         self.best_bid = 0           
@@ -57,8 +55,32 @@ class AvellanedaGridBot(GridTradingBot):
         self.last_order_refresh_time = time.time()
         self.is_warmed_up = False # 新增暖機狀態標記
         
-        logger.info(f"Avellaneda (GLFT) Bot 初始化: Gamma={gamma}, A={A:.2f}, k={k:.2f}, Sigma={sigma:.8f}")
-    
+        # 初始化時嘗試自動調整 Gamma (如果價格已知，否則等 run loop)
+        # 這裡暫時先用預設，等 loop 中第一次獲取價格後調整
+        
+        logger.info(f"Avellaneda (GLFT) Bot 初始化: A={A:.2f}, k={k:.2f}, Sigma={sigma:.8f}, InitGamma={gamma}")
+
+    def auto_tune_gamma(self):
+        """
+        根據當前市場參數 (A, k, sigma) 和 最大持倉限制 (POSITION_LIMIT)
+        自動計算合適的 Gamma
+        """
+        if self.latest_price <= 0: return
+
+        try:
+            tick_size = 10 ** (-self.price_precision)
+        except:
+            tick_size = 0.0001
+            
+        new_gamma = solve_gamma_for_risk_target(
+            self.sigma, self.A, self.k, 
+            tick_size, self.latest_price, 
+            POSITION_LIMIT, # 來自 bot.py
+            target_ratio=AUTO_GAMMA_TARGET_RATIO
+        )
+        
+        self.gamma = new_gamma
+
     def _calculate_avellaneda_prices(self, price):
         """
         [輔助方法] 計算 Avellaneda-GLFT 模型下的公允價格和最佳報價
@@ -177,6 +199,10 @@ class AvellanedaGridBot(GridTradingBot):
             self.k = new_k
             self.last_calibration_time = current_time
             logger.info(f"!!! 參數實時更新 !!! A={self.A:.4f}/min, k={self.k:.4f} (Window={time_span:.1f}s, N={len(deltas)})")
+            
+            # 【新增】參數更新後，同步自動調整 Gamma
+            self.auto_tune_gamma()
+            
         else:
             logger.warning(f"實時校準失敗或參數無效，保持原值: A={self.A}, k={self.k}")
 
@@ -245,6 +271,10 @@ class AvellanedaGridBot(GridTradingBot):
                 # 這裡我們手動調用內部邏輯或重置時間
                 self.last_calibration_time = 0 
                 self.recalibrate_parameters()
+                
+                # 【新增】暖機完成後，立即自動調整一次 Gamma
+                self.auto_tune_gamma()
+                
                 self.is_warmed_up = True
                 logger.info("暖機完成！開始執行 GLFT 造市策略。")
         # --- End Warm-up Check ---

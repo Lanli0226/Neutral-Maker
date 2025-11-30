@@ -242,6 +242,74 @@ def compute_glft_params(gamma, sigma, T, A, k, delta_price):
         logger.error(f"GLFT 參數計算錯誤: {e}, 返回默認值")
         return 0.0, 0.0
 
+def solve_gamma_for_risk_target(sigma_min, A_min, k, tick_size, price, max_pos, target_ratio=0.8) -> float:
+    """
+    反推 Gamma:
+    目標: 當持倉量 = max_pos 時，Skew = target_ratio * HalfSpread
+    也就是: Skew * max_pos = target_ratio * (HalfSpread)
+    
+    參數:
+    - sigma_min: 每分鐘波動率
+    - A_min: 每分鐘交易強度
+    - k: 衰減係數 (無量綱或對應價格單位，這裡假設輸入是原始 k)
+    - tick_size: 最小跳動點
+    - price: 當前價格
+    - max_pos: 最大持倉量
+    - target_ratio: 目標比例 (預設 0.8，即滿倉時偏移 80% 的 Spread)
+    """
+    try:
+        # 1. 單位轉換 (全部轉為 Tick 單位，與 bot 邏輯一致)
+        # Sigma (min) -> Sigma (Tick)
+        # 注意: bot 裡用的是 sigma_min (因為參數都是分鐘制)
+        # 但 GLFT 公式裡的 sigma 需對應時間單位。
+        # 我們的 A, k 都是分鐘制，所以 sigma 也要用分鐘制。
+        sigma_tick = (price * sigma_min) / tick_size
+        
+        # k (per $) -> k (per Tick)
+        k_tick = k * tick_size
+        
+        # 搜尋範圍 Gamma (per $)
+        # Gamma_tick = Gamma_$ * Tick_Size
+        # 我們直接搜尋 Gamma_$
+        low = 1e-5
+        high = 1000.0
+        best_gamma = 10.0
+        min_diff = float('inf')
+        
+        for _ in range(20): # 二分搜尋 20 次
+            mid_gamma = (low + high) / 2
+            gamma_tick = mid_gamma * tick_size
+            
+            # 計算 c1, c2 (Delta=1 Tick)
+            c1, c2 = compute_glft_params(gamma_tick, sigma_tick, None, A_min, k_tick, delta_price=1.0)
+            
+            half_spread_tick = c1 + 0.5 * sigma_tick * c2
+            skew_tick = sigma_tick * c2
+            
+            # 目標方程: skew * max_pos = ratio * half_spread
+            lhs = skew_tick * max_pos
+            rhs = target_ratio * half_spread_tick
+            
+            diff = lhs - rhs
+            
+            if abs(diff) < min_diff:
+                min_diff = abs(diff)
+                best_gamma = mid_gamma
+            
+            # 如果 skew 太大 (lhs > rhs)，代表 gamma 太大 -> 往小搜
+            # 如果 skew 太小 (lhs < rhs)，代表 gamma 太小 -> 往大搜
+            if lhs > rhs:
+                high = mid_gamma
+            else:
+                low = mid_gamma
+                
+        logger.info(f"Gamma 自動反推: Target={target_ratio:.1f}*Spread@MaxPos({max_pos}) -> New Gamma={best_gamma:.4f}")
+        return best_gamma
+
+    except Exception as e:
+        logger.error(f"Gamma 反推計算失敗: {e}")
+        return 10.0 # Fallback
+
 def calibrate_from_deltas(deltas: list[float], time_span_sec: float) -> tuple[float, float]:
     """
     根據預先計算好的 Delta (成交價與中間價距離) 列表估算 A, k。

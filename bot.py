@@ -13,10 +13,14 @@ import ccxt
 import math
 import os
 from collections import deque
+from dotenv import load_dotenv
+
+# 加載環境變數
+load_dotenv()
 
 # ==================== 配置 ====================
-API_KEY = ""  # 替換為你的 API Key
-API_SECRET = ""  # 替換為你的 API Secret
+API_KEY = os.getenv("API_KEY", "")  # 替換為你的 API Key
+API_SECRET = os.getenv("API_SECRET", "")  # 替換為你的 API Secret
 COIN_NAME = "XRP"  # 交易幣種
 GRID_SPACING = 0.006  # 補倉間距 (0.6%)
 TAKE_PROFIT_SPACING = 0.004  # 止盈間距 (0.4%)
@@ -24,7 +28,7 @@ INITIAL_QUANTITY = 1  # 初始交易數量 (張數)
 LEVERAGE = 20  # 槓桿倍數
 WEBSOCKET_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"  # WebSocket URL
 POSITION_THRESHOLD = 500  # 鎖倉閾值
-POSITION_LIMIT = 100  # 持倉數量閾值
+POSITION_LIMIT = int(os.getenv("POSITION_LIMIT", 100))  # 持倉數量閾值 (單位: 張)
 ORDER_COOLDOWN_TIME = 60  # 鎖倉後的反向掛單冷卻時間（秒）
 SYNC_TIME = 3  # 同步時間（秒）
 ORDER_FIRST_TIME = 1  # 首單間隔時間
