@@ -5,17 +5,21 @@ import logging
 import os
 # 假設 GridTradingBot 和所有必要的常量、logger 都從 bot.py 導入
 from bot import GridTradingBot, logger 
-from avellaneda_utils import auto_calculate_params
+from avellaneda_utils import auto_calculate_params, compute_glft_params, calibrate_from_deltas
 from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== Avellaneda 參數配置 (動態獲取) ====================
 # 【重要】這些參數將在 main 函數中被 auto_calculate_params 的結果覆蓋
-AVE_GAMMA = 1.0       # 風險厭惡係數 (固定值)
-AVE_T_END = 1         # 交易時間週期 (T, 調整為 1 小時, 固定值)
+AVE_GAMMA = 0.0001    # 風險厭惡係數 (此處視為每美元庫存的風險厭惡，建議調小因為單位是絕對金額)
+# 注意: 原來的 1.0 對於幣圈(價格大)可能過大，或者需要視為 "每單位合約"
+# 如果 gamma 過大，Spread 會非常寬。
+
+AVE_T_END = 1         # (GLFT 模型中此參數不再直接用於定價，保留作為參考或擴展)
 Taker_Fee_Rate = 0.0005 # <-- 【請在此處設置您的 Taker 費率】
 AVE_SIGMA = 0.0       # <--- 初始為 0，將被計算值覆蓋
-AVE_ETA = 0.0         # <--- 初始為 0，將被計算值覆蓋
+AVE_A = 0.0           # <--- 初始為 0，將被計算值覆蓋 (交易強度)
+AVE_K = 0.0           # <--- 初始為 0，將被計算值覆蓋 (流動性衰減)
 
 # 假設 bot.py 中的核心配置
 API_KEY = os.getenv("API_KEY")
@@ -26,13 +30,14 @@ TAKE_PROFIT_SPACING = 0.0004
 INITIAL_QUANTITY = 1
 LEVERAGE = 20
 POSITION_THRESHOLD = 500
-ORDER_COOLDOWN_TIME = 60 
+ORDER_COOLDOWN_TIME = 60
+CALIBRATION_INTERVAL = 60 # 實時校準間隔 (秒)
 
 # ==================== Avellaneda 繼承類 (保持不變) ====================
 class AvellanedaGridBot(GridTradingBot):
     
     def __init__(self, api_key, api_secret, coin_name, grid_spacing, initial_quantity, leverage, 
-                 take_profit_spacing=None, gamma=AVE_GAMMA, eta=AVE_ETA, sigma=AVE_SIGMA, T_end=AVE_T_END):
+                 take_profit_spacing=None, gamma=AVE_GAMMA, A=AVE_A, k=AVE_K, sigma=AVE_SIGMA, T_end=AVE_T_END):
         
         # 1. 呼叫父類別的初始化方法
         super().__init__(api_key, api_secret, coin_name, grid_spacing, initial_quantity, leverage, take_profit_spacing)
@@ -40,50 +45,114 @@ class AvellanedaGridBot(GridTradingBot):
         # 2. 初始化 Avellaneda 專有參數
         # 這裡使用的是 main 函數計算後的最新全局變量值
         self.gamma = gamma          # 風險厭惡係數
-        self.eta = eta              # 交易成本係數
-        self.sigma = sigma          # 波動率估計
-        self.T_end = T_end          # 交易總時間 (單位：小時)
+        self.A = A                  # 交易強度參數 A
+        self.k = k                  # 流動性衰減參數 k (kappa)
+        self.sigma = sigma          # 波動率估計 (百分比/時間)
+        self.T_end = T_end          # (GLFT 模型主要使用 A, k，T_end 僅作備用)
         self.reserve_price = 0      
         self.inventory = 0          
         self.best_bid = 0           
         self.best_ask = 0           
-        logger.info(f"Avellaneda Bot 初始化: Gamma={gamma}, Eta={eta:.2f}, Sigma={sigma:.8f}")
+        self.last_calibration_time = time.time()
+        
+        logger.info(f"Avellaneda (GLFT) Bot 初始化: Gamma={gamma}, A={A:.2f}, k={k:.2f}, Sigma={sigma:.8f}")
     
     def _calculate_avellaneda_prices(self, price):
         """
-        [輔助方法] 計算 Avellaneda 模型下的公允價格和最佳報價
+        [輔助方法] 計算 Avellaneda-GLFT 模型下的公允價格和最佳報價
+        使用 Guéant–Lehalle–Fernandez-Tapia (GLFT) 閉式解
         """
         
         # 1. 更新庫存 (淨持倉量)
         self.inventory = self.long_position - self.short_position
         
-        # 2. 剩餘時間 T
-        T = self.T_end
-        
-        # 3. 公允價格 (Reserve Price) 計算: R = S - q * gamma * sigma^2 * T
-        # S = 當前市場價格 (price)
-        self.reserve_price = price - self.inventory * self.gamma * (self.sigma**2) * T
-
-        # 4. 最優報價寬度 (delta) 計算: Delta = 1/2 * gamma * sigma^2 * T + 1/gamma * ln(1 + gamma / eta)
+        # 2. 準備參數轉換 (轉為 Tick 單位以符合 GLFT 離散模型公式)
         try:
-            term1 = 0.5 * self.gamma * (self.sigma**2) * T
-            term2 = (1 / self.gamma) * math.log(1 + self.gamma / self.eta)
-            delta = term1 + term2
-        except (ValueError, ZeroDivisionError) as e:
-            logger.error(f"Delta 計算異常: {e}. 使用備用 Delta.")
-            delta = self.grid_spacing * price * 0.5 # 使用基於價格的網格備用 Delta
+            tick_size = 10 ** (-self.price_precision)
+        except:
+            tick_size = 0.0001 # Fallback
             
-        # 5. 計算最佳報價
-        self.best_bid = self.reserve_price - delta
-        self.best_ask = self.reserve_price + delta
+        # Sigma (百分比) -> Sigma (Tick)
+        # 假設 self.sigma 是單位時間的對數收益率標準差 (e.g. 1小時)
+        # 價格波動 (絕對值) ~ Price * Sigma
+        # Sigma_tick = (Price * Sigma) / Tick_Size
+        sigma_tick = (price * self.sigma) / tick_size
+        
+        # k (per $) -> k (per Tick)
+        # k_tick = k_$ * Tick_Size
+        k_tick = self.k * tick_size
+        
+        # Gamma (per $) -> Gamma (per Tick)
+        # Gamma_tick = Gamma_$ * Tick_Size
+        gamma_tick = self.gamma * tick_size
+        
+        # 3. 計算 GLFT 係數 c1, c2
+        # delta (價格單位) 設為 1.0 (代表 1 Tick)
+        c1, c2 = compute_glft_params(gamma_tick, sigma_tick, None, self.A, k_tick, delta_price=1.0)
+        
+        # 4. 計算 Spread 和 Skew (Tick 單位)
+        # 根據 PDF:
+        # half_spread = c1 + (Delta/2) * sigma * c2
+        # skew = sigma * c2
+        # 這裡 Delta=1 (Tick)
+        
+        half_spread_tick = c1 + 0.5 * sigma_tick * c2
+        skew_tick = sigma_tick * c2
+        
+        # 5. 轉回價格單位
+        half_spread_price = half_spread_tick * tick_size
+        skew_price = skew_tick * tick_size
+        
+        # 6. 計算報價
+        # Bid = Fair - (HalfSpread + Skew * q)
+        # Ask = Fair + (HalfSpread - Skew * q)
+        # Reserve Price (Fair Price with Skew) = Mid - Skew * q
+        
+        # GLFT 定義的 Reservation Price (公允價) 偏移量是 Skew * q
+        # 如果 q > 0 (多頭)，Reserve Price 下降，鼓勵賣出
+        self.reserve_price = price - (skew_price * self.inventory)
+        
+        self.best_bid = self.reserve_price - half_spread_price
+        self.best_ask = self.reserve_price + half_spread_price
         
         # 價格保護
         self.best_bid = max(0.0, self.best_bid) 
         self.best_ask = max(0.0, self.best_ask) 
         
-        logger.info(f"Avellaneda: R={self.reserve_price:.8f}, Inv={self.inventory:.2f}, Delta={delta:.8f}")
+        logger.info(f"GLFT: P={price:.4f}, Inv={self.inventory}, R={self.reserve_price:.4f}, "
+                    f"Spread={2*half_spread_price:.4f} (HS={half_spread_price:.4f}), Skew={skew_price:.6f}")
         
-    
+    def recalibrate_parameters(self):
+        """定期根據收集的實時成交數據重新校準 A, k"""
+        current_time = time.time()
+        if current_time - self.last_calibration_time < CALIBRATION_INTERVAL:
+            return
+
+        # 檢查是否有足夠數據
+        if len(self.public_trade_deltas) < 50:
+            return
+            
+        # 提取數據 (複製以防並發修改)
+        trades_snapshot = list(self.public_trade_deltas)
+        deltas = [x[1] for x in trades_snapshot]
+        
+        # 計算時間窗口 (秒)
+        min_time = trades_snapshot[0][0]
+        max_time = trades_snapshot[-1][0]
+        time_span = max_time - min_time
+        if time_span <= 1.0: time_span = 1.0
+        
+        # 執行校準
+        new_A, new_k = calibrate_from_deltas(deltas, time_span)
+        
+        if new_A > 0 and new_k > 0:
+            self.A = new_A
+            self.k = new_k
+            self.last_calibration_time = current_time
+            logger.info(f"!!! 參數實時更新 !!! A={self.A:.4f}, k={self.k:.4f} (基於 {len(deltas)} 筆成交, {time_span:.1f}s)")
+        else:
+            logger.warning(f"實時校準失敗或參數無效，保持原值: A={self.A}, k={self.k}")
+
     def update_mid_price(self, side, price):
         self._calculate_avellaneda_prices(price)
         self.upper_price_long = self.upper_price_short = self.best_ask
@@ -134,6 +203,10 @@ class AvellanedaGridBot(GridTradingBot):
 
     async def adjust_grid_strategy(self):
         self.check_and_reduce_positions()
+        
+        # 嘗試進行實時參數校準
+        self.recalibrate_parameters()
+        
         current_time = time.time()
         latest_price = self.latest_price
         
@@ -156,15 +229,15 @@ class AvellanedaGridBot(GridTradingBot):
 # 7. 主程序入口
 async def main():
     # 步驟 1: 自動計算 Avellaneda 參數，並覆蓋全局變量
-    global AVE_SIGMA, AVE_ETA
-    AVE_SIGMA, AVE_ETA = auto_calculate_params(COIN_NAME, Taker_Fee_Rate)
+    global AVE_SIGMA, AVE_A, AVE_K
+    AVE_SIGMA, AVE_A, AVE_K = auto_calculate_params(COIN_NAME, Taker_Fee_Rate)
 
     # 步驟 2: 實例化機器人，使用計算後的參數
     bot = AvellanedaGridBot(
         API_KEY, API_SECRET, COIN_NAME,
         GRID_SPACING, INITIAL_QUANTITY, LEVERAGE,
         TAKE_PROFIT_SPACING,
-        gamma=AVE_GAMMA, eta=AVE_ETA, sigma=AVE_SIGMA, T_end=AVE_T_END
+        gamma=AVE_GAMMA, A=AVE_A, k=AVE_K, sigma=AVE_SIGMA, T_end=AVE_T_END
     )
     
     # 步驟 3: 運行機器人

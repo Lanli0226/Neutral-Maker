@@ -12,6 +12,7 @@ import time
 import ccxt
 import math
 import os
+from collections import deque
 
 # ==================== 配置 ====================
 API_KEY = ""  # 替換為你的 API Key
@@ -81,8 +82,8 @@ class GridTradingBot:
         self.last_position_update_time = 0
         self.last_orders_update_time = 0
         self.latest_price = 0
-        self.best_bid_price = None
-        self.best_ask_price = None
+        self.best_bid_price = 0.0
+        self.best_ask_price = 0.0
         self.balance = {}
         self.mid_price_long = 0
         self.lower_price_long = 0
@@ -91,6 +92,9 @@ class GridTradingBot:
         self.lower_price_short = 0
         self.upper_price_short = 0
         self.last_strategy_run_time = 0.0
+        
+        # 實時數據收集
+        self.public_trade_deltas = deque(maxlen=10000) # 存儲 (timestamp, delta)
 
     def _initialize_exchange(self):
         """初始化交易所 API"""
@@ -174,6 +178,7 @@ class GridTradingBot:
             await self.subscribe_orders(websocket)
             await self.subscribe_book_ticker(websocket)
             await self.subscribe_balances(websocket)
+            await self.subscribe_public_trades(websocket)
 
             while True:
                 try:
@@ -191,6 +196,8 @@ class GridTradingBot:
                         await self.handle_book_ticker_update(message)
                     elif channel == "futures.balances":
                         await self.handle_balance_update(message)
+                    elif channel == "futures.trades":
+                        await self.handle_public_trade_update(message)
                 except Exception as e:
                     logger.error(f"WebSocket 消息處理失敗: {e}")
                     break
@@ -268,6 +275,43 @@ class GridTradingBot:
             "auth": {"method": "api_key", "KEY": self.api_key, "SIGN": sign},
         }
         await websocket.send(json.dumps(payload))
+
+    async def subscribe_public_trades(self, websocket):
+        """訂閱公共成交 (用於估算市場流動性)"""
+        current_time = int(time.time())
+        message = f"channel=futures.trades&event=subscribe&time={current_time}"
+        # Public channel usually doesn't need auth, but providing it is fine
+        payload = {
+            "time": current_time,
+            "channel": "futures.trades",
+            "event": "subscribe",
+            "payload": [self.ws_symbol],
+        }
+        await websocket.send(json.dumps(payload))
+
+    async def handle_public_trade_update(self, message):
+        """處理公共成交數據，計算並收集 Delta"""
+        data = json.loads(message)
+        if data.get("event") == "update":
+            trades = data.get("result", [])
+            if not trades: return
+            
+            # 如果沒有當前報價，無法計算距離
+            if self.best_bid_price <= 0 or self.best_ask_price <= 0:
+                return
+                
+            current_mid_price = (self.best_bid_price + self.best_ask_price) / 2.0
+            current_time = time.time()
+            
+            for trade in trades:
+                try:
+                    trade_price = float(trade.get('price', 0))
+                    if trade_price > 0:
+                        # 計算 Delta: |Trade - Mid|
+                        delta = abs(trade_price - current_mid_price)
+                        self.public_trade_deltas.append((current_time, delta))
+                except ValueError:
+                    continue
 
     async def handle_balance_update(self, message):
         """處理餘額更新"""
