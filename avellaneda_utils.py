@@ -124,22 +124,35 @@ def calibrate_market_params(trades_df: pd.DataFrame, kline_df: pd.DataFrame) -> 
         if merged_df["ref_mid_price"].isnull().any():
             merged_df["ref_mid_price"] = merged_df["ref_mid_price"].fillna(method='bfill').fillna(trades_df['price'].mean())
 
-        # 4. 計算 Delta: |Trade_Price - Ref_Mid_Price|
+        # 5. 計算 Delta: |Trade_Price - Ref_Mid_Price|
         merged_df['delta'] = (merged_df['price'] - merged_df['ref_mid_price']).abs()
         
+        # --- 優化: 只取最近一段時間 (例如 600秒 = 10分鐘) 的數據進行校準 ---
+        # 避免因為抓取了 1000 筆但跨度長達 1小時，導致 A (強度) 被平均得過低或過高
+        max_ts = merged_df["timestamp"].max()
+        cutoff_ts = max_ts - pd.Timedelta(seconds=600)
+        
+        recent_df = merged_df[merged_df["timestamp"] >= cutoff_ts]
+        
+        # 如果最近數據太少，還是用全部
+        if len(recent_df) < 50:
+            recent_df = merged_df
+            
         # 5. 計算時間窗口長度 (秒)
-        time_span_sec = (trades_df["timestamp"].max() - trades_df["timestamp"].min()).total_seconds()
+        # A = N / T. 如果 T 太大 (包含了很多無交易的空檔)，A 會變小。
+        # 但如果 T 只算首尾時間差，這就是真實的 "平均到達率"。
+        time_span_sec = (recent_df["timestamp"].max() - recent_df["timestamp"].min()).total_seconds()
         if time_span_sec < 1.0:
             time_span_sec = 1.0 # 避免除以零
             
         # 6. 統計 Delta 的分佈 (Histogram)
         # 自動決定分桶數量，或固定一個合理值
         bins_count = 20
-        delta_max = merged_df['delta'].max()
+        delta_max = recent_df['delta'].max()
         if delta_max == 0: delta_max = 0.0001 # 避免全 0
         
         bins = np.linspace(0, delta_max, bins_count)
-        counts, bin_edges = np.histogram(merged_df['delta'], bins=bins)
+        counts, bin_edges = np.histogram(recent_df['delta'], bins=bins)
         
         # 計算每個桶的中心 Delta
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
@@ -147,8 +160,16 @@ def calibrate_market_params(trades_df: pd.DataFrame, kline_df: pd.DataFrame) -> 
         # 過濾掉 count = 0 的點
         valid_idx = counts > 0
         if np.sum(valid_idx) < 2:
-            logger.warning("有效數據點過少，無法擬合，返回默認值。")
-            return 100.0, 50.0
+            logger.warning("有效數據點過少(集中)，使用簡易估算。")
+            # Fallback: A = N / T, k = default
+            total_count = len(merged_df)
+            A_est = total_count / time_span_sec
+            k_est = 2000.0
+            
+            # Apply limits (Seconds base)
+            if A_est > 33333.0: A_est = 33333.0
+            
+            return A_est, k_est
             
         log_counts = np.log(counts[valid_idx])
         valid_deltas = bin_centers[valid_idx]
@@ -174,6 +195,11 @@ def calibrate_market_params(trades_df: pd.DataFrame, kline_df: pd.DataFrame) -> 
         k = max(0.1, k)
         # A 必須為正
         A = max(0.001, A)
+        
+        # --- 防止參數暴走 (Capping) ---
+        # 這裡是秒制 A。限制為 33333 (約對應分制 200萬)
+        if A > 33333.0: A = 33333.0
+        if k > 50000.0: k = 50000.0
         
         logger.info(f"參數校準完成 (Window={time_span_sec:.1f}s): A={A:.4f} orders/sec, k={k:.2f}")
         return A, k
@@ -241,8 +267,25 @@ def calibrate_from_deltas(deltas: list[float], time_span_sec: float) -> tuple[fl
         
         # 過濾掉 count = 0 的點
         valid_idx = counts > 0
+        
+        # --- Fallback 邏輯：如果數據太集中 (例如只有 1 個 bin 有值)，無法做回歸 ---
         if np.sum(valid_idx) < 2:
-            return 0.0, 0.0
+            # 這通常發生在價格非常穩定的時候，Delta 幾乎都一樣
+            # 我們可以做一個合理的估計：
+            # A ~ N / T (總成交頻率)
+            # k ~ 較大的值 (因為 Delta 很小且集中，代表流動性衰減快?) 或者給個默認值
+            
+            total_count = len(deltas_arr)
+            A_est = total_count / time_span_sec
+            
+            # 使用一個相對保守的 k 值，或者沿用上一次的 k (但這裡無法獲取上一次的值)
+            # 假設市場集中，k 應該不小
+            k_est = 2000.0 
+            
+            # 同樣套用上限保護
+            if A_est > 2000000.0: A_est = 2000000.0
+            
+            return A_est, k_est
             
         log_counts = np.log(counts[valid_idx])
         valid_deltas = bin_centers[valid_idx]
@@ -260,7 +303,16 @@ def calibrate_from_deltas(deltas: list[float], time_span_sec: float) -> tuple[fl
         # 保護
         k = max(0.1, k)
         A = max(0.001, A)
+
+        # --- 防止參數暴走 (Capping) ---
+        # 如果 A 太大，Skew 會趨近於 0，導致失去庫存管理能力。
+        # 2,000,000 / min approx 33,333 / sec (非常極端的高頻)
+        if A > 2000000.0: 
+            A = 2000000.0
         
+        if k > 50000.0:
+            k = 50000.0
+            
         return A, k
 
     except Exception as e:
@@ -273,34 +325,36 @@ def auto_calculate_params(coin: str, taker_fee: float) -> tuple[float, float, fl
     """
     currency_pair = f"{coin}_USDT"
     
-    # 1. 獲取 1h K 線數據 (用於長期穩定的波動率計算)
-    # 720h = 30 days
-    kline_1h = get_gateio_kline(currency_pair, interval="1h", limit=720)
+    # 1. 獲取 1m K 線數據 (用於長期穩定的波動率計算)
+    # 720m = 12 小時 (通常足夠獲取近期波動率，且比 1h K 線更靈敏)
+    kline_1m = get_gateio_kline(currency_pair, interval="1m", limit=720)
     
-    # 2. 計算波動率 (Sigma_1h)
-    sigma_1h = calculate_historical_volatility(kline_1h)
-    if sigma_1h < 1e-5:
-        sigma_1h = 0.005
-        logger.warning(f"波動率計算結果過小或失敗，使用預設值 {sigma_1h}")
+    # 2. 計算波動率 (Sigma_1m)
+    sigma_1m = calculate_historical_volatility(kline_1m)
+    if sigma_1m < 1e-5:
+        sigma_1m = 0.005
+        logger.warning(f"波動率計算結果過小或失敗，使用預設值 {sigma_1m}")
         
-    # 轉換波動率為 [per second]
-    # sigma_sec = sigma_1h / sqrt(3600) = sigma_1h / 60
-    sigma_sec = sigma_1h / 60.0
+    # 轉換波動率為 [per minute]
+    # 用戶要求使用每分鐘波動率，不再除以 sqrt(60)
+    sigma_min = sigma_1m 
 
     # 3. 獲取 1m K 線數據 (用於校準 A, k 的參考價格)
     # 1000m approx 16 hours, 足夠覆蓋 recent trades
-    kline_1m = get_gateio_kline(currency_pair, interval="1m", limit=1000)
+    kline_1m_for_ak = get_gateio_kline(currency_pair, interval="1m", limit=1000)
 
     # 4. 獲取近期成交 (用於估算 A, k)
     trades_df = get_gateio_recent_trades(currency_pair, limit=1000)
     
-    # 5. 校準 A, k (A 將被標準化為 per second)
-    A, k = calibrate_market_params(trades_df, kline_1m)
+    # 5. 校準 A, k
+    # 原始 calibrate_market_params 返回的是 orders/sec，這裡需要轉換為 orders/min
+    A_sec, k = calibrate_market_params(trades_df, kline_1m_for_ak)
+    A_min = A_sec * 60.0
 
-    logger.info(f"--- Avellaneda (GLFT) 參數推算結果 ---")
-    logger.info(f"Sigma (1h): {sigma_1h:.4f} -> Sigma (1s): {sigma_sec:.8f}")
-    logger.info(f"A (Intensity): {A:.4f} orders/sec")
+    logger.info(f"--- Avellaneda (GLFT) 參數推算結果 (Base: Minute) ---")
+    logger.info(f"Sigma (1m): {sigma_min:.8f}")
+    logger.info(f"A (Intensity): {A_min:.4f} orders/min (Orig: {A_sec:.4f}/sec)")
     logger.info(f"k (Decay): {k:.4f}")
     logger.info(f"---------------------------------------")
 
-    return sigma_sec, A, k
+    return sigma_min, A_min, k

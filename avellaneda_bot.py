@@ -1,7 +1,5 @@
 import asyncio
 import time
-import math
-import logging
 import os
 # 假設 GridTradingBot 和所有必要的常量、logger 都從 bot.py 導入
 from bot import GridTradingBot, logger 
@@ -11,7 +9,7 @@ load_dotenv()
 
 # ==================== Avellaneda 參數配置 (動態獲取) ====================
 # 【重要】這些參數將在 main 函數中被 auto_calculate_params 的結果覆蓋
-AVE_GAMMA = 0.0001    # 風險厭惡係數 (此處視為每美元庫存的風險厭惡，建議調小因為單位是絕對金額)
+AVE_GAMMA = float(os.getenv("AVE_GAMMA", 10)) # 風險厭惡係數 (從環境變數讀取，預設為 10)
 # 注意: 原來的 1.0 對於幣圈(價格大)可能過大，或者需要視為 "每單位合約"
 # 如果 gamma 過大，Spread 會非常寬。
 
@@ -31,7 +29,9 @@ INITIAL_QUANTITY = 1
 LEVERAGE = 20
 POSITION_THRESHOLD = 500
 ORDER_COOLDOWN_TIME = 60
-CALIBRATION_INTERVAL = 60 # 實時校準間隔 (秒)
+CALIBRATION_INTERVAL = 300 # 實時校準間隔 (秒) - 改為 5 分鐘
+ORDER_REFRESH_TIME = float(os.getenv("ORDER_REFRESH_TIME", 20)) # 訂單刷新/重掛單間隔 (秒)
+MIN_SPREAD_PERCENT = float(os.getenv("MIN_SPREAD_PERCENT", 0.02)) # 最小掛單價差保護 (百分比, 例如 0.02 代表 0.02%)
 
 # ==================== Avellaneda 繼承類 (保持不變) ====================
 class AvellanedaGridBot(GridTradingBot):
@@ -54,6 +54,8 @@ class AvellanedaGridBot(GridTradingBot):
         self.best_bid = 0           
         self.best_ask = 0           
         self.last_calibration_time = time.time()
+        self.last_order_refresh_time = time.time()
+        self.is_warmed_up = False # 新增暖機狀態標記
         
         logger.info(f"Avellaneda (GLFT) Bot 初始化: Gamma={gamma}, A={A:.2f}, k={k:.2f}, Sigma={sigma:.8f}")
     
@@ -102,12 +104,16 @@ class AvellanedaGridBot(GridTradingBot):
         # 5. 轉回價格單位
         half_spread_price = half_spread_tick * tick_size
         skew_price = skew_tick * tick_size
+
+        # --- 最小價差保護 (Min Spread Protection) ---
+        # 確保 half_spread 不小於設定的百分比 (例如 0.02% 的一半)
+        min_abs_half_spread = price * (MIN_SPREAD_PERCENT / 100) / 2 
+        if half_spread_price < min_abs_half_spread:
+            logger.debug(f"觸發最小價差保護: 計算值 {half_spread_price:.8f} < 最小保護 {min_abs_half_spread:.8f}, 調整為 {min_abs_half_spread:.8f}")
+            half_spread_price = min_abs_half_spread
+        # --- End Min Spread Protection ---
         
         # 6. 計算報價
-        # Bid = Fair - (HalfSpread + Skew * q)
-        # Ask = Fair + (HalfSpread - Skew * q)
-        # Reserve Price (Fair Price with Skew) = Mid - Skew * q
-        
         # GLFT 定義的 Reservation Price (公允價) 偏移量是 Skew * q
         # 如果 q > 0 (多頭)，Reserve Price 下降，鼓勵賣出
         self.reserve_price = price - (skew_price * self.inventory)
@@ -119,8 +125,11 @@ class AvellanedaGridBot(GridTradingBot):
         self.best_bid = max(0.0, self.best_bid) 
         self.best_ask = max(0.0, self.best_ask) 
         
+        # 計算百分比價差
+        spread_percent = (2 * half_spread_price / price) * 100
+        
         logger.info(f"GLFT: P={price:.4f}, Inv={self.inventory}, R={self.reserve_price:.4f}, "
-                    f"Spread={2*half_spread_price:.4f} (HS={half_spread_price:.4f}), Skew={skew_price:.6f}")
+                    f"Spread={2*half_spread_price:.4f} ({spread_percent:.4f}%), HS={half_spread_price:.4f}, Skew={skew_price:.6f}")
         
     def recalibrate_parameters(self):
         """定期根據收集的實時成交數據重新校準 A, k"""
@@ -128,28 +137,46 @@ class AvellanedaGridBot(GridTradingBot):
         if current_time - self.last_calibration_time < CALIBRATION_INTERVAL:
             return
 
-        # 檢查是否有足夠數據
-        if len(self.public_trade_deltas) < 50:
+        # 檢查是否有足夠數據 (提高門檻到 200 筆)
+        if len(self.public_trade_deltas) < 200:
             return
             
         # 提取數據 (複製以防並發修改)
         trades_snapshot = list(self.public_trade_deltas)
-        deltas = [x[1] for x in trades_snapshot]
+        
+        # 只保留最近 300 秒的數據 (Rolling Window)
+        # 改為 5 分鐘窗口，與校準間隔一致
+        cutoff_time = current_time - 300
+        recent_trades = [x for x in trades_snapshot if x[0] >= cutoff_time]
+        
+        # 如果最近 300秒數據太少 (< 200筆)，回退到使用更多數據
+        if len(recent_trades) < 200:
+            logger.info(f"最近 300s 數據不足 ({len(recent_trades)}筆)，擴大範圍使用最近 1000 筆...")
+            recent_trades = trades_snapshot[-1000:] # 取最近 1000 筆
+            
+        if not recent_trades:
+            return
+
+        deltas = [x[1] for x in recent_trades]
         
         # 計算時間窗口 (秒)
-        min_time = trades_snapshot[0][0]
-        max_time = trades_snapshot[-1][0]
+        min_time = recent_trades[0][0]
+        max_time = recent_trades[-1][0]
         time_span = max_time - min_time
-        if time_span <= 1.0: time_span = 1.0
+        
+        # 保護: 如果數據都在同一毫秒，time_span 可能為 0
+        if time_span <= 0.1: time_span = 1.0
         
         # 執行校準
-        new_A, new_k = calibrate_from_deltas(deltas, time_span)
+        # calibrate_from_deltas 返回的是 orders/sec
+        new_A_sec, new_k = calibrate_from_deltas(deltas, time_span)
         
-        if new_A > 0 and new_k > 0:
-            self.A = new_A
+        if new_A_sec > 0 and new_k > 0:
+            # 轉換為 orders/min
+            self.A = new_A_sec * 60.0
             self.k = new_k
             self.last_calibration_time = current_time
-            logger.info(f"!!! 參數實時更新 !!! A={self.A:.4f}, k={self.k:.4f} (基於 {len(deltas)} 筆成交, {time_span:.1f}s)")
+            logger.info(f"!!! 參數實時更新 !!! A={self.A:.4f}/min, k={self.k:.4f} (Window={time_span:.1f}s, N={len(deltas)})")
         else:
             logger.warning(f"實時校準失敗或參數無效，保持原值: A={self.A}, k={self.k}")
 
@@ -202,12 +229,41 @@ class AvellanedaGridBot(GridTradingBot):
             
 
     async def adjust_grid_strategy(self):
+        # --- 暖機檢查 (Warm-up Check) ---
+        if not self.is_warmed_up:
+            data_count = len(self.public_trade_deltas)
+            required_count = 200
+            
+            if data_count < required_count:
+                # 為了避免日誌刷屏，可以每隔幾次或一定時間輸出一次，這裡簡單處理每次輸出
+                # 建議使用者如果覺得煩，可以自己加計時器控制 log 頻率
+                logger.info(f"機器人暖機中: 收集實時成交數據 {data_count}/{required_count} ... 暫不掛單")
+                return
+            else:
+                logger.info("數據收集完成，執行首次實時參數校準...")
+                # 強制執行一次校準 (忽略時間間隔檢查，因為這是第一次)
+                # 這裡我們手動調用內部邏輯或重置時間
+                self.last_calibration_time = 0 
+                self.recalibrate_parameters()
+                self.is_warmed_up = True
+                logger.info("暖機完成！開始執行 GLFT 造市策略。")
+        # --- End Warm-up Check ---
+
         self.check_and_reduce_positions()
         
         # 嘗試進行實時參數校準
         self.recalibrate_parameters()
         
         current_time = time.time()
+        
+        # --- 訂單定期刷新機制 (Re-quoting) ---
+        # GLFT 策略需要緊跟市場價格，定期撤單重掛是標準操作
+        if current_time - self.last_order_refresh_time > ORDER_REFRESH_TIME:
+            logger.info(f"達到刷新週期 ({ORDER_REFRESH_TIME}s)，撤銷舊單以重置報價...")
+            self.cancel_orders_for_side('long')
+            self.cancel_orders_for_side('short')
+            self.last_order_refresh_time = current_time
+        
         latest_price = self.latest_price
         
         if latest_price:
