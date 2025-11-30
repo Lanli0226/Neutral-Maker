@@ -78,6 +78,31 @@ python avellaneda_bot.py
     *   基於當前庫存量、市場價格、以及實時校準後的 $\sigma, A, k, \gamma$ 參數，模型會計算出動態的**公允價格 (Reserve Price)** 和**最優報價價差 (Optimal Spread)**。
     *   機器人會根據這些計算結果，智能地掛出買賣訂單，以實現庫存中性和捕獲價差的目標。
 
+### GLFT 模型核心公式
+
+**訂單流強度估計**：
+$$ \lambda(\delta) = A e^{-k \delta} $$
+其中：
+- $\delta$：訂單距離中間價的價格距離。
+- $A$：訂單到達強度（Orders/Sec），$k$：流動性衰減係數。
+
+**GLFT 係數 $c_1, c_2$ 計算**：
+$$ c_1 = \frac{1}{\gamma \Delta} \ln \left( 1 + \frac{\gamma \Delta}{k} \right) $$
+$$ c_2 = \sqrt{\frac{\gamma}{2 A \Delta k} \left( 1 + \frac{\gamma \Delta}{k} \right)^{\frac{k}{\gamma \Delta} + 1}} $$
+其中：
+- $\gamma$：風險厭惡係數（單位為 1/貨幣單位）。
+- $\Delta$：離散價格步長（在代碼中設為 1 Tick）。
+- $A, k$：同上。
+
+**最佳報價**：
+$$ P_{bid} = P_{mid} - (c_1 + \frac{\Delta}{2} \sigma c_2 + q \sigma c_2) $$
+$$ P_{ask} = P_{mid} + (c_1 + \frac{\Delta}{2} \sigma c_2 - q \sigma c_2) $$
+其中：
+- $P_{mid}$：當前市場中間價。
+- $\sigma$：波動率（標準化為每秒）。
+- $q$：當前庫存量。
+- 其他符號同上。
+
 ## ⚠️ 風險提示 (Disclaimer)
 
   * **高頻撤單**：此策略會頻繁撤單和掛單，請留意交易所的 API Rate Limit (頻率限制)。
